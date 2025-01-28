@@ -84,6 +84,9 @@ impl<'a> Scope<'a> {
             false
         } else {
             self.allowed.iter().any(|entry| {
+                if format!("{:?}", entry.url) == "*" {
+                    return true;
+                }
                 entry
                     .url
                     .test(UrlPatternMatchInput::Url(url.clone()))
