@@ -91,7 +91,7 @@ impl<'a> Scope<'a> {
                     .url
                     .test(UrlPatternMatchInput::Url(url.clone()))
                     .unwrap_or_default()
-            })
+            })  
         }
     }
 }
