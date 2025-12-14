@@ -1,5 +1,27 @@
 # Changelog
 
+## \[2.3.2]
+
+- [`93426f85`](https://github.com/tauri-apps/plugins-workspace/commit/93426f85120f49beb9f40222bff45185a32d54a9) Fixed an issue that caused docs.rs builds to fail. No user facing changes.
+
+## \[2.3.1]
+
+- [`6c9b61fb`](https://github.com/tauri-apps/plugins-workspace/commit/6c9b61fb658145d13893626112fc489f7458aa17) ([#3039](https://github.com/tauri-apps/plugins-workspace/pull/3039) by [@FabianLars](https://github.com/tauri-apps/plugins-workspace/../../FabianLars)) On Android, updated compileSdk to 36.
+
+## \[2.3.0]
+
+- [`f209b2f2`](https://github.com/tauri-apps/plugins-workspace/commit/f209b2f23cb29133c97ad5961fb46ef794dbe063) ([#2804](https://github.com/tauri-apps/plugins-workspace/pull/2804) by [@renovate](https://github.com/tauri-apps/plugins-workspace/../../renovate)) Updated tauri to 2.6
+
+## \[2.2.3]
+
+- [`f634e524`](https://github.com/tauri-apps/plugins-workspace/commit/f634e5248ebe428f8305a59f74c13fc15147fb8e) This is an "empty" release to update the plugins' source files on crates.io and docs.rs. This should fix docs.rs build failures for projects using tauri plugins as dependencies.
+
+## \[2.2.2]
+
+### bug
+
+- [`d37bbdef`](https://github.com/tauri-apps/plugins-workspace/commit/d37bbdef8dc70e61e59f9fe0bb8b2a48999d0aa1) ([#2507](https://github.com/tauri-apps/plugins-workspace/pull/2507) by [@SquitchYT](https://github.com/tauri-apps/plugins-workspace/../../SquitchYT)) Fix clipboard-manager Wayland support.
+
 ## \[2.2.1]
 
 - [`ce11079f`](https://github.com/tauri-apps/plugins-workspace/commit/ce11079f19852fbefdecf0e4c7d947af3624fee0) ([#2280](https://github.com/tauri-apps/plugins-workspace/pull/2280) by [@FabianLars](https://github.com/tauri-apps/plugins-workspace/../../FabianLars)) Explicitly drop `arboard::Clipboard` on exit. Add recommendation to not use read methods on the mainthread.

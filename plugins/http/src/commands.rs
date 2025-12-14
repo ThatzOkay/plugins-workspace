@@ -315,6 +315,7 @@ pub async fn fetch<R: Runtime>(
                 tracing::trace!("{:?}", request);
 
                 let fut = async move { request.send().await.map_err(Into::into) };
+
                 let mut resources_table = webview.resources_table();
                 let rid = resources_table.add_request(Box::pin(fut));
 
@@ -358,7 +359,7 @@ pub fn fetch_cancel<R: Runtime>(webview: Webview<R>, rid: ResourceId) -> crate::
     Ok(())
 }
 
-#[tauri::command]
+#[command]
 pub async fn fetch_send<R: Runtime>(
     webview: Webview<R>,
     rid: ResourceId,
@@ -410,17 +411,47 @@ pub async fn fetch_send<R: Runtime>(
     })
 }
 
-#[tauri::command]
-pub(crate) async fn fetch_read_body<R: Runtime>(
+#[command]
+pub async fn fetch_read_body<R: Runtime>(
     webview: Webview<R>,
     rid: ResourceId,
 ) -> crate::Result<tauri::ipc::Response> {
     let res = {
-        let mut resources_table = webview.resources_table();
-        resources_table.take::<ReqwestResponse>(rid)?
+        let resources_table = webview.resources_table();
+        resources_table.get::<ReqwestResponse>(rid)?
     };
-    let res = Arc::into_inner(res).unwrap().0;
-    Ok(tauri::ipc::Response::new(res.bytes().await?.to_vec()))
+
+    // SAFETY: we can access the inner value mutably
+    // because we are the only ones with a reference to it
+    // and we don't want to use `Arc::into_inner` because we want to keep the value in the table
+    // for potential future calls to `fetch_cancel_body`
+    let res_ptr = Arc::as_ptr(&res) as *mut ReqwestResponse;
+    let res = unsafe { &mut *res_ptr };
+    let res = &mut res.0;
+
+    let Some(chunk) = res.chunk().await? else {
+        let mut resources_table = webview.resources_table();
+        resources_table.close(rid)?;
+
+        // return a response with a single byte to indicate that the body is empty
+        return Ok(tauri::ipc::Response::new(vec![1]));
+    };
+
+    let mut chunk = chunk.to_vec();
+    // append a 0 byte to indicate that the body is not empty
+    chunk.push(0);
+
+    Ok(tauri::ipc::Response::new(chunk))
+}
+
+#[command]
+pub async fn fetch_cancel_body<R: Runtime>(
+    webview: Webview<R>,
+    rid: ResourceId,
+) -> crate::Result<()> {
+    let mut resources_table = webview.resources_table();
+    resources_table.close(rid)?;
+    Ok(())
 }
 
 // forbidden headers per fetch spec https://fetch.spec.whatwg.org/#terminology-headers

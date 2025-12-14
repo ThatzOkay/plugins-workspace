@@ -17,7 +17,7 @@ use std::ffi::OsStr;
 
 use base64::Engine;
 use futures_util::StreamExt;
-use http::HeaderName;
+use http::{header::ACCEPT, HeaderName};
 use minisign_verify::{PublicKey, Signature};
 use percent_encoding::{AsciiSet, CONTROLS};
 use reqwest::{
@@ -26,7 +26,13 @@ use reqwest::{
 };
 use semver::Version;
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
-use tauri::{utils::platform::current_exe, AppHandle, Resource, Runtime};
+use tauri::{
+    utils::{
+        config::BundleType,
+        platform::{bundle_type, current_exe},
+    },
+    AppHandle, Resource, Runtime,
+};
 use time::OffsetDateTime;
 use url::Url;
 
@@ -36,6 +42,31 @@ use crate::{
 };
 
 const UPDATER_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+
+#[derive(Copy, Clone)]
+pub enum Installer {
+    AppImage,
+    Deb,
+    Rpm,
+
+    App,
+
+    Msi,
+    Nsis,
+}
+
+impl Installer {
+    fn name(self) -> &'static str {
+        match self {
+            Self::AppImage => "appimage",
+            Self::Deb => "deb",
+            Self::Rpm => "rpm",
+            Self::App => "app",
+            Self::Msi => "msi",
+            Self::Nsis => "nsis",
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ReleaseManifestPlatform {
@@ -96,6 +127,7 @@ impl RemoteRelease {
 }
 
 pub type OnBeforeExit = Arc<dyn Fn() + Send + Sync + 'static>;
+pub type OnBeforeRequest = Arc<dyn Fn(ClientBuilder) -> ClientBuilder + Send + Sync + 'static>;
 pub type VersionComparator = Arc<dyn Fn(Version, RemoteRelease) -> bool + Send + Sync>;
 type MainThreadClosure = Box<dyn FnOnce() + Send + Sync + 'static>;
 type RunOnMainThread =
@@ -117,13 +149,13 @@ pub struct UpdaterBuilder {
     installer_args: Vec<OsString>,
     current_exe_args: Vec<OsString>,
     on_before_exit: Option<OnBeforeExit>,
+    configure_client: Option<OnBeforeRequest>,
 }
 
 impl UpdaterBuilder {
     pub(crate) fn new<R: Runtime>(app: &AppHandle<R>, config: crate::Config) -> Self {
         let app_ = app.clone();
-        let run_on_main_thread =
-            move |f: Box<dyn FnOnce() + Send + Sync + 'static>| app_.run_on_main_thread(f);
+        let run_on_main_thread = move |f| app_.run_on_main_thread(f);
         Self {
             run_on_main_thread: Box::new(run_on_main_thread),
             installer_args: config
@@ -143,6 +175,7 @@ impl UpdaterBuilder {
             timeout: None,
             proxy: None,
             on_before_exit: None,
+            configure_client: None,
         }
     }
 
@@ -214,6 +247,7 @@ impl UpdaterBuilder {
         self
     }
 
+    /// Adds an argument to pass to the Windows installer.
     pub fn installer_arg<S>(mut self, arg: S) -> Self
     where
         S: Into<OsString>,
@@ -222,23 +256,42 @@ impl UpdaterBuilder {
         self
     }
 
+    /// Adds multiple arguments to pass to the Windows installer.
     pub fn installer_args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
-        let args = args.into_iter().map(|a| a.into()).collect::<Vec<_>>();
-        self.installer_args.extend_from_slice(&args);
+        self.installer_args.extend(args.into_iter().map(Into::into));
         self
     }
 
+    /// Removes all the additional arguments to pass to the Windows installer.
+    ///
+    /// Note: this only removes the additional arguments added through
+    /// [`Self::installer_arg`], [`crate::Builder::installer_arg`]
+    /// and the `plugins > updater > windows > installerArgs` config,
+    /// not the ones managed by us (e.g. `/UPDATER` flag passed to the NSIS installer)
     pub fn clear_installer_args(mut self) -> Self {
         self.installer_args.clear();
         self
     }
 
+    /// Function to run before we run the installer and exit the app through `std::process::exit(0)` on Windows
     pub fn on_before_exit<F: Fn() + Send + Sync + 'static>(mut self, f: F) -> Self {
         self.on_before_exit.replace(Arc::new(f));
+        self
+    }
+
+    /// Allows you to modify the `reqwest` client builder before the HTTP request is sent.
+    ///
+    /// Note that `reqwest` crate may be updated in minor releases of tauri-plugin-updater.
+    /// Therefore it's recommended to pin the plugin to at least a minor version when you're using `configure_client`.
+    pub fn configure_client<F: Fn(ClientBuilder) -> ClientBuilder + Send + Sync + 'static>(
+        mut self,
+        f: F,
+    ) -> Self {
+        self.configure_client.replace(Arc::new(f));
         self
     }
 
@@ -251,13 +304,7 @@ impl UpdaterBuilder {
             return Err(Error::EmptyEndpoints);
         };
 
-        let arch = get_updater_arch().ok_or(Error::UnsupportedArch)?;
-        let (target, json_target) = if let Some(target) = self.target {
-            (target.clone(), target)
-        } else {
-            let target = get_updater_target().ok_or(Error::UnsupportedOs)?;
-            (target.to_string(), format!("{target}-{arch}"))
-        };
+        let arch = updater_arch().ok_or(Error::UnsupportedArch)?;
 
         let executable_path = self.executable_path.clone().unwrap_or(current_exe()?);
 
@@ -280,11 +327,11 @@ impl UpdaterBuilder {
             installer_args: self.installer_args,
             current_exe_args: self.current_exe_args,
             arch,
-            target,
-            json_target,
+            target: self.target,
             headers: self.headers,
             extract_path,
             on_before_exit: self.on_before_exit,
+            configure_client: self.configure_client,
         })
     }
 }
@@ -295,8 +342,8 @@ impl UpdaterBuilder {
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
-        let args = args.into_iter().map(|a| a.into()).collect::<Vec<_>>();
-        self.current_exe_args.extend_from_slice(&args);
+        self.current_exe_args
+            .extend(args.into_iter().map(Into::into));
         self
     }
 }
@@ -312,13 +359,13 @@ pub struct Updater {
     proxy: Option<Url>,
     endpoints: Vec<Url>,
     arch: &'static str,
-    // The `{{target}}` variable we replace in the endpoint
-    target: String,
-    // The value we search if the updater server returns a JSON with the `platforms` object
-    json_target: String,
+    // The `{{target}}` variable we replace in the endpoint and serach for in the JSON,
+    // this is either the user provided target or the current operating system by default
+    target: Option<String>,
     headers: HeaderMap,
     extract_path: PathBuf,
     on_before_exit: Option<OnBeforeExit>,
+    configure_client: Option<OnBeforeRequest>,
     #[allow(unused)]
     installer_args: Vec<OsString>,
     #[allow(unused)]
@@ -329,7 +376,9 @@ impl Updater {
     pub async fn check(&self) -> Result<Option<Update>> {
         // we want JSON only
         let mut headers = self.headers.clone();
-        headers.insert("Accept", HeaderValue::from_str("application/json").unwrap());
+        if !headers.contains_key(ACCEPT) {
+            headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        }
 
         // Set SSL certs for linux if they aren't available.
         #[cfg(target_os = "linux")]
@@ -341,12 +390,17 @@ impl Updater {
                 std::env::set_var("SSL_CERT_DIR", "/etc/ssl/certs");
             }
         }
+        let target = if let Some(target) = &self.target {
+            target
+        } else {
+            updater_os().ok_or(Error::UnsupportedOs)?
+        };
 
         let mut remote_release: Option<RemoteRelease> = None;
         let mut raw_json: Option<serde_json::Value> = None;
         let mut last_error: Option<Error> = None;
         for url in &self.endpoints {
-            // replace {{current_version}}, {{target}} and {{arch}} in the provided URL
+            // replace {{current_version}}, {{target}}, {{arch}} and {{bundle_type}} in the provided URL
             // this is useful if we need to query example
             // https://releases.myapp.com/update/{{target}}/{{arch}}/{{current_version}}
             // will be translated into ->
@@ -358,27 +412,46 @@ impl Updater {
             const CONTROLS_ADD: &AsciiSet = &CONTROLS.add(b'+');
             let encoded_version = percent_encoding::percent_encode(version, CONTROLS_ADD);
             let encoded_version = encoded_version.to_string();
+            let installer = installer_for_bundle_type(bundle_type())
+                .map(|i| i.name())
+                .unwrap_or("unknown");
 
             let url: Url = url
                 .to_string()
                 // url::Url automatically url-encodes the path components
                 .replace("%7B%7Bcurrent_version%7D%7D", &encoded_version)
-                .replace("%7B%7Btarget%7D%7D", &self.target)
+                .replace("%7B%7Btarget%7D%7D", target)
                 .replace("%7B%7Barch%7D%7D", self.arch)
+                .replace("%7B%7Bbundle_type%7D%7D", installer)
                 // but not query parameters
                 .replace("{{current_version}}", &encoded_version)
-                .replace("{{target}}", &self.target)
+                .replace("{{target}}", target)
                 .replace("{{arch}}", self.arch)
+                .replace("{{bundle_type}}", installer)
                 .parse()?;
 
+            log::debug!("checking for updates {url}");
+
             let mut request = ClientBuilder::new().user_agent(UPDATER_USER_AGENT);
+            if self.config.dangerous_accept_invalid_certs {
+                request = request.danger_accept_invalid_certs(true);
+            }
+            if self.config.dangerous_accept_invalid_hostnames {
+                request = request.danger_accept_invalid_hostnames(true);
+            }
             if let Some(timeout) = self.timeout {
                 request = request.timeout(timeout);
             }
             if let Some(ref proxy) = self.proxy {
+                log::debug!("using proxy {proxy}");
                 let proxy = reqwest::Proxy::all(proxy.as_str())?;
                 request = request.proxy(proxy);
             }
+
+            if let Some(ref configure_client) = self.configure_client {
+                request = configure_client(request);
+            }
+
             let response = request
                 .build()?
                 .get(url)
@@ -391,24 +464,38 @@ impl Updater {
                     if res.status().is_success() {
                         // no updates found!
                         if StatusCode::NO_CONTENT == res.status() {
+                            log::debug!("update endpoint returned 204 No Content");
                             return Ok(None);
                         };
 
-                        raw_json = Some(res.json().await?);
-                        match serde_json::from_value::<RemoteRelease>(raw_json.clone().unwrap())
+                        let update_response: serde_json::Value = res.json().await?;
+                        log::debug!("update response: {update_response:?}");
+                        raw_json = Some(update_response.clone());
+                        match serde_json::from_value::<RemoteRelease>(update_response)
                             .map_err(Into::into)
                         {
                             Ok(release) => {
+                                log::debug!("parsed release response {release:?}");
                                 last_error = None;
                                 remote_release = Some(release);
-                                // we found a relase, break the loop
+                                // we found a release, break the loop
                                 break;
                             }
-                            Err(err) => last_error = Some(err),
+                            Err(err) => {
+                                log::error!("failed to deserialize update response: {err}");
+                                last_error = Some(err)
+                            }
                         }
+                    } else {
+                        log::error!(
+                            "update endpoint did not respond with a successful status code"
+                        );
                     }
                 }
-                Err(err) => last_error = Some(err.into()),
+                Err(err) => {
+                    log::error!("failed to check for updates: {err}");
+                    last_error = Some(err.into())
+                }
             }
         }
 
@@ -426,6 +513,9 @@ impl Updater {
             None => release.version > self.current_version,
         };
 
+        let installer = installer_for_bundle_type(bundle_type());
+        let (download_url, signature) = self.get_urls(&release, &installer)?;
+
         let update = if should_update {
             Some(Update {
                 run_on_main_thread: self.run_on_main_thread.clone(),
@@ -433,25 +523,58 @@ impl Updater {
                 on_before_exit: self.on_before_exit.clone(),
                 app_name: self.app_name.clone(),
                 current_version: self.current_version.to_string(),
-                target: self.target.clone(),
+                target: target.to_owned(),
                 extract_path: self.extract_path.clone(),
                 version: release.version.to_string(),
                 date: release.pub_date,
-                download_url: release.download_url(&self.json_target)?.to_owned(),
-                body: release.notes.clone(),
-                signature: release.signature(&self.json_target)?.to_owned(),
+                download_url: download_url.clone(),
+                signature: signature.to_owned(),
+                body: release.notes,
                 raw_json: raw_json.unwrap(),
-                timeout: self.timeout,
+                timeout: None,
                 proxy: self.proxy.clone(),
                 headers: self.headers.clone(),
                 installer_args: self.installer_args.clone(),
                 current_exe_args: self.current_exe_args.clone(),
+                configure_client: self.configure_client.clone(),
             })
         } else {
             None
         };
 
         Ok(update)
+    }
+
+    fn get_urls<'a>(
+        &self,
+        release: &'a RemoteRelease,
+        installer: &Option<Installer>,
+    ) -> Result<(&'a Url, &'a String)> {
+        // Use the user provided target
+        if let Some(target) = &self.target {
+            return Ok((release.download_url(target)?, release.signature(target)?));
+        }
+
+        // Or else we search for [`{os}-{arch}-{installer}`, `{os}-{arch}`] in order
+        let os = updater_os().ok_or(Error::UnsupportedOs)?;
+        let arch = self.arch;
+        let mut targets = Vec::new();
+        if let Some(installer) = installer {
+            let installer = installer.name();
+            targets.push(format!("{os}-{arch}-{installer}"));
+        }
+        targets.push(format!("{os}-{arch}"));
+
+        for target in &targets {
+            log::debug!("Searching for updater target '{target}' in release data");
+            if let (Ok(download_url), Ok(signature)) =
+                (release.download_url(target), release.signature(target))
+            {
+                return Ok((download_url, signature));
+            };
+        }
+
+        Err(Error::TargetsNotFound(targets))
     }
 }
 
@@ -470,7 +593,8 @@ pub struct Update {
     pub version: String,
     /// Update publish date
     pub date: Option<OffsetDateTime>,
-    /// Target
+    /// The `{{target}}` variable we replace in the endpoint and search for in the JSON,
+    /// this is either the user provided target or the current operating system by default
     pub target: String,
     /// Download URL announced
     pub download_url: Url,
@@ -494,6 +618,7 @@ pub struct Update {
     installer_args: Vec<OsString>,
     #[allow(unused)]
     current_exe_args: Vec<OsString>,
+    configure_client: Option<OnBeforeRequest>,
 }
 
 impl Resource for Update {}
@@ -509,18 +634,26 @@ impl Update {
     ) -> Result<Vec<u8>> {
         // set our headers
         let mut headers = self.headers.clone();
-        headers.insert(
-            "Accept",
-            HeaderValue::from_str("application/octet-stream").unwrap(),
-        );
+        if !headers.contains_key(ACCEPT) {
+            headers.insert(ACCEPT, HeaderValue::from_static("application/octet-stream"));
+        }
 
         let mut request = ClientBuilder::new().user_agent(UPDATER_USER_AGENT);
+        if self.config.dangerous_accept_invalid_certs {
+            request = request.danger_accept_invalid_certs(true);
+        }
+        if self.config.dangerous_accept_invalid_hostnames {
+            request = request.danger_accept_invalid_hostnames(true);
+        }
         if let Some(timeout) = self.timeout {
             request = request.timeout(timeout);
         }
         if let Some(ref proxy) = self.proxy {
             let proxy = reqwest::Proxy::all(proxy.as_str())?;
             request = request.proxy(proxy);
+        }
+        if let Some(ref configure_client) = self.configure_client {
+            request = configure_client(request);
         }
         let response = request
             .build()?
@@ -639,17 +772,25 @@ impl Update {
         let install_mode = self.config.install_mode();
         let current_args = &self.current_exe_args()[1..];
         let msi_args;
+        let nsis_args;
 
         let installer_args: Vec<&OsStr> = match &updater_type {
-            WindowsUpdaterType::Nsis { .. } => install_mode
-                .nsis_args()
-                .iter()
-                .map(OsStr::new)
-                .chain(once(OsStr::new("/UPDATE")))
-                .chain(once(OsStr::new("/ARGS")))
-                .chain(current_args.to_vec())
-                .chain(self.installer_args())
-                .collect(),
+            WindowsUpdaterType::Nsis { .. } => {
+                nsis_args = current_args
+                    .iter()
+                    .map(escape_nsis_current_exe_arg)
+                    .collect::<Vec<_>>();
+
+                install_mode
+                    .nsis_args()
+                    .iter()
+                    .map(OsStr::new)
+                    .chain(once(OsStr::new("/UPDATE")))
+                    .chain(once(OsStr::new("/ARGS")))
+                    .chain(nsis_args.iter().map(OsStr::new))
+                    .chain(self.installer_args())
+                    .collect()
+            }
             WindowsUpdaterType::Msi { path, .. } => {
                 let escaped_args = current_args
                     .iter()
@@ -670,6 +811,7 @@ impl Update {
         };
 
         if let Some(on_before_exit) = self.on_before_exit.as_ref() {
+            log::debug!("running on_before_exit hook");
             on_before_exit();
         }
 
@@ -799,11 +941,10 @@ impl Update {
     /// └── ...
     ///
     fn install_inner(&self, bytes: &[u8]) -> Result<()> {
-        if self.is_deb_package() {
-            self.install_deb(bytes)
-        } else {
-            // Handle AppImage or other formats
-            self.install_appimage(bytes)
+        match installer_for_bundle_type(bundle_type()) {
+            Some(Installer::Deb) => self.install_deb(bytes),
+            Some(Installer::Rpm) => self.install_rpm(bytes),
+            _ => self.install_appimage(bytes),
         }
     }
 
@@ -838,6 +979,7 @@ impl Update {
 
                     #[cfg(feature = "zip")]
                     if infer::archive::is_gz(bytes) {
+                        log::debug!("extracting AppImage");
                         // extract the buffer to the tmp_dir
                         // we extract our signed archive into our final directory without any temp file
                         let archive = Cursor::new(bytes);
@@ -861,6 +1003,7 @@ impl Update {
                         return Err(Error::BinaryNotFoundInArchive);
                     }
 
+                    log::debug!("rewriting AppImage");
                     return match std::fs::write(&self.extract_path, bytes)
                         .and_then(|_| std::fs::set_permissions(&self.extract_path, permissions))
                     {
@@ -878,45 +1021,25 @@ impl Update {
         Err(Error::TempDirNotOnSameMountPoint)
     }
 
-    fn is_deb_package(&self) -> bool {
-        // First check if we're in a typical Debian installation path
-        let in_system_path = self
-            .extract_path
-            .to_str()
-            .map(|p| p.starts_with("/usr"))
-            .unwrap_or(false);
-
-        if !in_system_path {
-            return false;
-        }
-
-        // Then verify it's actually a Debian-based system by checking for dpkg
-        let dpkg_exists = std::path::Path::new("/var/lib/dpkg").exists();
-        let apt_exists = std::path::Path::new("/etc/apt").exists();
-
-        // Additional check for the package in dpkg database
-        let package_in_dpkg = if let Ok(output) = std::process::Command::new("dpkg")
-            .args(["-S", &self.extract_path.to_string_lossy()])
-            .output()
-        {
-            output.status.success()
-        } else {
-            false
-        };
-
-        // Consider it a deb package only if:
-        // 1. We're in a system path AND
-        // 2. We have Debian package management tools AND
-        // 3. The binary is tracked by dpkg
-        dpkg_exists && apt_exists && package_in_dpkg
-    }
-
     fn install_deb(&self, bytes: &[u8]) -> Result<()> {
         // First verify the bytes are actually a .deb package
         if !infer::archive::is_deb(bytes) {
+            log::warn!("update is not a valid deb package");
             return Err(Error::InvalidUpdaterFormat);
         }
 
+        self.try_tmp_locations(bytes, "dpkg", "-i")
+    }
+
+    fn install_rpm(&self, bytes: &[u8]) -> Result<()> {
+        // First verify the bytes are actually a .rpm package
+        if !infer::archive::is_rpm(bytes) {
+            return Err(Error::InvalidUpdaterFormat);
+        }
+        self.try_tmp_locations(bytes, "rpm", "-U")
+    }
+
+    fn try_tmp_locations(&self, bytes: &[u8], install_cmd: &str, install_arg: &str) -> Result<()> {
         // Try different temp directories
         let tmp_dir_locations = vec![
             Box::new(|| Some(std::env::temp_dir())) as Box<dyn FnOnce() -> Option<PathBuf>>,
@@ -928,15 +1051,19 @@ impl Update {
         for tmp_dir_location in tmp_dir_locations {
             if let Some(path) = tmp_dir_location() {
                 if let Ok(tmp_dir) = tempfile::Builder::new()
-                    .prefix("tauri_deb_update")
+                    .prefix("tauri_rpm_update")
                     .tempdir_in(path)
                 {
-                    let deb_path = tmp_dir.path().join("package.deb");
+                    let pkg_path = tmp_dir.path().join("package.rpm");
 
                     // Try writing the .deb file
-                    if std::fs::write(&deb_path, bytes).is_ok() {
+                    if std::fs::write(&pkg_path, bytes).is_ok() {
                         // If write succeeds, proceed with installation
-                        return self.try_install_with_privileges(&deb_path);
+                        return self.try_install_with_privileges(
+                            &pkg_path,
+                            install_cmd,
+                            install_arg,
+                        );
                     }
                     // If write fails, continue to next temp location
                 }
@@ -947,37 +1074,45 @@ impl Update {
         Err(Error::TempDirNotFound)
     }
 
-    fn try_install_with_privileges(&self, deb_path: &Path) -> Result<()> {
+    fn try_install_with_privileges(
+        &self,
+        pkg_path: &Path,
+        install_cmd: &str,
+        install_arg: &str,
+    ) -> Result<()> {
         // 1. First try using pkexec (graphical sudo prompt)
         if let Ok(status) = std::process::Command::new("pkexec")
-            .arg("dpkg")
-            .arg("-i")
-            .arg(deb_path)
+            .arg(install_cmd)
+            .arg(install_arg)
+            .arg(pkg_path)
             .status()
         {
             if status.success() {
+                log::debug!("installed deb with pkexec");
                 return Ok(());
             }
         }
 
         // 2. Try zenity or kdialog for a graphical sudo experience
         if let Ok(password) = self.get_password_graphically() {
-            if self.install_with_sudo(deb_path, &password)? {
+            if self.install_with_sudo(pkg_path, &password, install_cmd, install_arg)? {
+                log::debug!("installed deb with GUI sudo");
                 return Ok(());
             }
         }
 
         // 3. Final fallback: terminal sudo
         let status = std::process::Command::new("sudo")
-            .arg("dpkg")
-            .arg("-i")
-            .arg(deb_path)
+            .arg(install_cmd)
+            .arg(install_arg)
+            .arg(pkg_path)
             .status()?;
 
         if status.success() {
+            log::debug!("installed deb with sudo");
             Ok(())
         } else {
-            Err(Error::DebInstallFailed)
+            Err(Error::PackageInstallFailed)
         }
     }
 
@@ -1011,15 +1146,21 @@ impl Update {
         Err(Error::AuthenticationFailed)
     }
 
-    fn install_with_sudo(&self, deb_path: &Path, password: &str) -> Result<bool> {
+    fn install_with_sudo(
+        &self,
+        pkg_path: &Path,
+        password: &str,
+        install_cmd: &str,
+        install_arg: &str,
+    ) -> Result<bool> {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
         let mut child = Command::new("sudo")
             .arg("-S") // read password from stdin
-            .arg("dpkg")
-            .arg("-i")
-            .arg(deb_path)
+            .arg(install_cmd)
+            .arg(install_arg)
+            .arg(pkg_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1027,7 +1168,7 @@ impl Update {
 
         if let Some(mut stdin) = child.stdin.take() {
             // Write password to stdin
-            writeln!(stdin, "{}", password)?;
+            writeln!(stdin, "{password}")?;
         }
 
         let status = child.wait()?;
@@ -1098,6 +1239,7 @@ impl Update {
         };
 
         if need_authorization {
+            log::debug!("app installation needs admin privileges");
             // Use AppleScript to perform moves with admin privileges
             let apple_script = format!(
                 "do shell script \"rm -rf '{src}' && mv -f '{new}' '{src}'\" with administrator privileges",
@@ -1139,16 +1281,18 @@ impl Update {
     }
 }
 
-/// Gets the target string used on the updater.
+/// Gets the base target string used by the updater. If bundle type is available it
+/// will be added to this string when selecting the download URL and signature.
+/// `tauri::utils::platform::bundle_type` method is used to obtain current bundle type.
 pub fn target() -> Option<String> {
-    if let (Some(target), Some(arch)) = (get_updater_target(), get_updater_arch()) {
+    if let (Some(target), Some(arch)) = (updater_os(), updater_arch()) {
         Some(format!("{target}-{arch}"))
     } else {
         None
     }
 }
 
-pub(crate) fn get_updater_target() -> Option<&'static str> {
+fn updater_os() -> Option<&'static str> {
     if cfg!(target_os = "linux") {
         Some("linux")
     } else if cfg!(target_os = "macos") {
@@ -1161,7 +1305,7 @@ pub(crate) fn get_updater_target() -> Option<&'static str> {
     }
 }
 
-pub(crate) fn get_updater_arch() -> Option<&'static str> {
+fn updater_arch() -> Option<&'static str> {
     if cfg!(target_arch = "x86") {
         Some("i686")
     } else if cfg!(target_arch = "x86_64") {
@@ -1170,6 +1314,8 @@ pub(crate) fn get_updater_arch() -> Option<&'static str> {
         Some("armv7")
     } else if cfg!(target_arch = "aarch64") {
         Some("aarch64")
+    } else if cfg!(target_arch = "riscv64") {
+        Some("riscv64")
     } else {
         None
     }
@@ -1253,6 +1399,18 @@ impl<'de> Deserialize<'de> for RemoteRelease {
     }
 }
 
+fn installer_for_bundle_type(bundle: Option<BundleType>) -> Option<Installer> {
+    match bundle? {
+        BundleType::Deb => Some(Installer::Deb),
+        BundleType::Rpm => Some(Installer::Rpm),
+        BundleType::AppImage => Some(Installer::AppImage),
+        BundleType::Msi => Some(Installer::Msi),
+        BundleType::Nsis => Some(Installer::Nsis),
+        BundleType::App => Some(Installer::App), // App is also returned for Dmg type
+        _ => None,
+    }
+}
+
 fn parse_version<'de, D>(deserializer: D) -> std::result::Result<Version, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1309,6 +1467,41 @@ impl PathExt for PathBuf {
     }
 }
 
+// adapted from https://github.com/rust-lang/rust/blob/1c047506f94cd2d05228eb992b0a6bbed1942349/library/std/src/sys/args/windows.rs#L174
+#[cfg(windows)]
+fn escape_nsis_current_exe_arg(arg: &&OsStr) -> String {
+    let arg = arg.to_string_lossy();
+    let mut cmd: Vec<char> = Vec::new();
+
+    // compared to std we additionally escape `/` so that nsis won't interpret them as a beginning of an nsis argument.
+    let quote = arg.chars().any(|c| c == ' ' || c == '\t' || c == '/') || arg.is_empty();
+    let escape = true;
+    if quote {
+        cmd.push('"');
+    }
+    let mut backslashes: usize = 0;
+    for x in arg.chars() {
+        if escape {
+            if x == '\\' {
+                backslashes += 1;
+            } else {
+                if x == '"' {
+                    // Add n+1 backslashes to total 2n+1 before internal '"'.
+                    cmd.extend((0..=backslashes).map(|_| '\\'));
+                }
+                backslashes = 0;
+            }
+        }
+        cmd.push(x);
+    }
+    if quote {
+        // Add n backslashes to total 2n before ending '"'.
+        cmd.extend((0..backslashes).map(|_| '\\'));
+        cmd.push('"');
+    }
+    cmd.into_iter().collect()
+}
+
 #[cfg(windows)]
 fn escape_msi_property_arg(arg: impl AsRef<OsStr>) -> String {
     let mut arg = arg.as_ref().to_string_lossy().to_string();
@@ -1321,7 +1514,7 @@ fn escape_msi_property_arg(arg: impl AsRef<OsStr>) -> String {
     }
 
     if arg.contains('"') {
-        arg = arg.replace('"', r#""""""#)
+        arg = arg.replace('"', r#""""""#);
     }
 
     if arg.starts_with('-') {
@@ -1352,7 +1545,7 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn it_escapes_correctly() {
+    fn it_escapes_correctly_for_msi() {
         use crate::updater::escape_msi_property_arg;
 
         // Explanation for quotes:
@@ -1395,6 +1588,49 @@ mod tests {
 
         for (orig, escaped) in cases.iter().zip(cases_escaped) {
             assert_eq!(escape_msi_property_arg(orig), escaped);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn it_escapes_correctly_for_nsis() {
+        use crate::updater::escape_nsis_current_exe_arg;
+        use std::ffi::OsStr;
+
+        let cases = [
+            "something",
+            "--flag",
+            "--empty=",
+            "--arg=value",
+            "some space",                     // This simulates `./my-app "some string"`.
+            "--arg value", // -> This simulates `./my-app "--arg value"`. Same as above but it triggers the startsWith(`-`) logic.
+            "--arg=unwrapped space", // `./my-app --arg="unwrapped space"`
+            "--arg=\"wrapped\"", // `./my-app --args=""wrapped""`
+            "--arg=\"wrapped space\"", // `./my-app --args=""wrapped space""`
+            "--arg=midword\"wrapped space\"", // `./my-app --args=midword""wrapped""`
+            "",            // `./my-app '""'`
+        ];
+        // Note: These may not be the results we actually want (monitor this!).
+        // We only make sure the implementation doesn't unintentionally change.
+        let cases_escaped = [
+            "something",
+            "--flag",
+            "--empty=",
+            "--arg=value",
+            "\"some space\"",
+            "\"--arg value\"",
+            "\"--arg=unwrapped space\"",
+            "--arg=\\\"wrapped\\\"",
+            "\"--arg=\\\"wrapped space\\\"\"",
+            "\"--arg=midword\\\"wrapped space\\\"\"",
+            "\"\"",
+        ];
+
+        // Just to be sure we didn't mess that up
+        assert_eq!(cases.len(), cases_escaped.len());
+
+        for (orig, escaped) in cases.iter().zip(cases_escaped) {
+            assert_eq!(escape_nsis_current_exe_arg(&OsStr::new(orig)), escaped);
         }
     }
 }

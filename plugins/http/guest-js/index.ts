@@ -106,7 +106,7 @@ export interface DangerousSettings {
   acceptInvalidHostnames?: boolean
 }
 
-const ERROR_REQUEST_CANCELLED = 'Request canceled'
+const ERROR_REQUEST_CANCELLED = 'Request cancelled'
 
 /**
  * Fetch a resource from the network. It returns a `Promise` that resolves to the
@@ -126,7 +126,7 @@ export async function fetch(
   input: URL | Request | string,
   init?: RequestInit & ClientOptions
 ): Promise<Response> {
-  // abort early here if needed
+  // Optimistically check for abort signal and avoid doing any work
   const signal = init?.signal
   if (signal?.aborted) {
     throw new Error(ERROR_REQUEST_CANCELLED)
@@ -181,7 +181,7 @@ export async function fetch(
     ]
   )
 
-  // abort early here if needed
+  // Optimistically check for abort signal and avoid doing any work on the Rust side
   if (signal?.aborted) {
     throw new Error(ERROR_REQUEST_CANCELLED)
   }
@@ -201,7 +201,8 @@ export async function fetch(
 
   const abort = () => invoke('plugin:http|fetch_cancel', { rid })
 
-  // abort early here if needed
+  // Optimistically check for abort signal
+  // and avoid doing any work after doing intial work on the Rust side
   if (signal?.aborted) {
     // we don't care about the result of this proimse
     // eslint-disable-next-line @typescript-eslint/no-floating-promises
@@ -229,31 +230,64 @@ export async function fetch(
     rid
   })
 
-  const body = await invoke<ArrayBuffer | number[]>(
-    'plugin:http|fetch_read_body',
-    {
-      rid: responseRid
-    }
-  )
+  const dropBody = () => {
+    return invoke('plugin:http|fetch_cancel_body', { rid: responseRid })
+  }
 
-  const res = new Response(
-    body instanceof ArrayBuffer && body.byteLength !== 0
-      ? body
-      : body instanceof Array && body.length > 0
-        ? new Uint8Array(body)
-        : null,
-    {
-      status,
-      statusText
+  const readChunk = async (
+    controller: ReadableStreamDefaultController<Uint8Array>
+  ) => {
+    let data: ArrayBuffer
+    try {
+      data = await invoke('plugin:http|fetch_read_body', {
+        rid: responseRid
+      })
+    } catch (e) {
+      // close the stream if an error occurs
+      // and drop the body on Rust side
+      controller.error(e)
+      void dropBody()
+      return
     }
-  )
 
-  // url and headers are read only properties
-  // but seems like we can set them like this
+    const dataUint8 = new Uint8Array(data)
+    const lastByte = dataUint8[dataUint8.byteLength - 1]
+    const actualData = dataUint8.slice(0, dataUint8.byteLength - 1)
+
+    // close when the signal to close (last byte is 1) is sent from the IPC.
+    if (lastByte === 1) {
+      controller.close()
+      return
+    }
+
+    controller.enqueue(actualData)
+  }
+
+  // no body for 101, 103, 204, 205 and 304
+  // see https://fetch.spec.whatwg.org/#null-body-status
+  const body = [101, 103, 204, 205, 304].includes(status)
+    ? null
+    : new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          // listen for abort events to cancel reading
+          signal?.addEventListener('abort', () => {
+            controller.error(ERROR_REQUEST_CANCELLED)
+            void dropBody()
+          })
+        },
+        pull: (controller) => readChunk(controller)
+      })
+
+  const res = new Response(body, {
+    status,
+    statusText
+  })
+
+  // Set `Response` properties that are ignored by the
+  // constructor, like url and some headers
   //
-  // we define theme like this, because using `Response`
-  // constructor, it removes url and some headers
-  // like `set-cookie` headers
+  // Since url and headers are read only properties
+  // this is the only way to set them.
   Object.defineProperty(res, 'url', { value: url })
   Object.defineProperty(res, 'headers', {
     value: new Headers(responseHeaders)

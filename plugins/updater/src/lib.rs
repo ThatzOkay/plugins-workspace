@@ -148,16 +148,17 @@ impl Builder {
         self
     }
 
+    /// Adds an additional argument to pass to the Windows installer.
     pub fn installer_args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
-        let args = args.into_iter().map(|a| a.into()).collect::<Vec<_>>();
-        self.installer_args.extend_from_slice(&args);
+        self.installer_args.extend(args.into_iter().map(Into::into));
         self
     }
 
+    /// Adds multiple additional arguments to pass to the Windows installer.
     pub fn installer_arg<S>(mut self, arg: S) -> Self
     where
         S: Into<OsString>,
@@ -166,6 +167,10 @@ impl Builder {
         self
     }
 
+    /// Removes all the additional arguments to pass to the Windows installer.
+    ///
+    /// Note: this only removes the additional arguments added through [`Self::installer_args`],
+    /// not the ones managed by us (e.g. `/UPDATER` flag passed to the NSIS installer)
     pub fn clear_installer_args(mut self) -> Self {
         self.installer_args.clear();
         self
@@ -214,7 +219,7 @@ impl Builder {
                     config.pubkey = pubkey;
                 }
                 if let Some(windows) = &mut config.windows {
-                    windows.installer_args.extend_from_slice(&installer_args);
+                    windows.installer_args.extend(installer_args);
                 }
                 app.manage(UpdaterState {
                     target,

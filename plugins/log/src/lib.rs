@@ -10,12 +10,12 @@
 )]
 
 use fern::{Filter, FormatCallback};
-use log::{logger, RecordBuilder};
 use log::{LevelFilter, Record};
 use serde::Serialize;
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::{
     fmt::Arguments,
     fs::{self, File},
@@ -27,9 +27,12 @@ use tauri::{
     Manager, Runtime,
 };
 use tauri::{AppHandle, Emitter};
+use time::{macros::format_description, OffsetDateTime};
 
 pub use fern;
-use time::OffsetDateTime;
+pub use log;
+
+mod commands;
 
 pub const WEBVIEW_TARGET: &str = "webview";
 
@@ -40,13 +43,15 @@ mod ios {
     ));
 }
 
-const DEFAULT_MAX_FILE_SIZE: u128 = 40000;
+const DEFAULT_MAX_FILE_SIZE: u64 = 40000;
 const DEFAULT_ROTATION_STRATEGY: RotationStrategy = RotationStrategy::KeepOne;
 const DEFAULT_TIMEZONE_STRATEGY: TimezoneStrategy = TimezoneStrategy::UseUtc;
 const DEFAULT_LOG_TARGETS: [Target; 2] = [
     Target::new(TargetKind::Stdout),
     Target::new(TargetKind::LogDir { file_name: None }),
 ];
+const LOG_DATE_FORMAT: &[time::format_description::FormatItem<'_>] =
+    format_description!("[year]-[month]-[day]_[hour]-[minute]-[second]");
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -114,9 +119,14 @@ impl From<log::Level> for LogLevel {
     }
 }
 
+#[derive(Debug, Clone)]
 pub enum RotationStrategy {
+    /// Will keep all the logs, renaming them to include the date.
     KeepAll,
+    /// Will only keep the most recent log up to its maximal size.
     KeepOne,
+    /// Will keep some of the most recent logs, renaming them to include the date.
+    KeepSome(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +143,174 @@ impl TimezoneStrategy {
                 OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc())
             } // Fallback to UTC since Rust cannot determine local timezone
         }
+    }
+}
+
+/// A custom log writer that rotates the log file when it exceeds specified size.
+struct RotatingFile {
+    dir: PathBuf,
+    file_name: String,
+    path: PathBuf,
+    max_size: u64,
+    current_size: u64,
+    rotation_strategy: RotationStrategy,
+    timezone_strategy: TimezoneStrategy,
+    inner: Option<File>,
+    buffer: Vec<u8>,
+}
+
+impl RotatingFile {
+    pub fn new(
+        dir: impl AsRef<Path>,
+        file_name: String,
+        max_size: u64,
+        rotation_strategy: RotationStrategy,
+        timezone_strategy: TimezoneStrategy,
+    ) -> Result<Self, Error> {
+        let dir = dir.as_ref().to_path_buf();
+        let path = dir.join(&file_name).with_extension("log");
+
+        let mut rotator = Self {
+            dir,
+            file_name,
+            path,
+            max_size,
+            current_size: 0,
+            rotation_strategy,
+            timezone_strategy,
+            inner: None,
+            buffer: Vec::new(),
+        };
+
+        rotator.open_file()?;
+        if rotator.current_size >= rotator.max_size {
+            rotator.rotate()?;
+        }
+        if let RotationStrategy::KeepSome(keep_count) = rotator.rotation_strategy {
+            rotator.remove_old_files(keep_count)?;
+        }
+
+        Ok(rotator)
+    }
+
+    fn open_file(&mut self) -> Result<(), Error> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.current_size = file.metadata()?.len();
+        self.inner = Some(file);
+        Ok(())
+    }
+
+    fn rotate(&mut self) -> Result<(), Error> {
+        if let Some(mut file) = self.inner.take() {
+            let _ = file.flush();
+        }
+        if self.path.exists() {
+            match self.rotation_strategy {
+                RotationStrategy::KeepAll => {
+                    self.rename_file_to_dated()?;
+                }
+                RotationStrategy::KeepSome(keep_count) => {
+                    // remove_old_files excludes the active file.
+                    // So we need to keep (keep_count - 1) archived files to make room for the one we are about to archive.
+                    self.remove_old_files(keep_count - 1)?;
+                    self.rename_file_to_dated()?;
+                }
+                RotationStrategy::KeepOne => {
+                    fs::remove_file(&self.path)?;
+                }
+            }
+        }
+        self.open_file()?;
+        Ok(())
+    }
+
+    /// Remove old log files until the number of old log files is equal to the keep_count,
+    /// the current active log file is not included in the keep_count.
+    fn remove_old_files(&self, keep_count: usize) -> Result<(), Error> {
+        let mut files = fs::read_dir(&self.dir)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                let old_file_name = path.file_name()?.to_string_lossy().into_owned();
+                if old_file_name.starts_with(&self.file_name)
+                  // exclude the current active file
+                  && old_file_name != format!("{}.log", self.file_name)
+                {
+                    let date = old_file_name
+                        .strip_prefix(&self.file_name)?
+                        .strip_prefix("_")?
+                        .strip_suffix(".log")?;
+                    Some((path, date.to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        files.sort_by(|a, b| a.1.cmp(&b.1));
+
+        if files.len() > keep_count {
+            let files_to_remove = files.len() - keep_count;
+            for (old_log_path, _) in files.iter().take(files_to_remove) {
+                fs::remove_file(old_log_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn rename_file_to_dated(&self) -> Result<(), Error> {
+        let to = self.dir.join(format!(
+            "{}_{}.log",
+            self.file_name,
+            self.timezone_strategy
+                .get_now()
+                .format(LOG_DATE_FORMAT)
+                .unwrap(),
+        ));
+        if to.is_file() {
+            // designated rotated log file name already exists
+            // highly unlikely but defensively handle anyway by adding .bak to filename
+            let mut to_bak = to.clone();
+            to_bak.set_file_name(format!(
+                "{}.bak",
+                to_bak.file_name().unwrap().to_string_lossy()
+            ));
+            fs::rename(&to, to_bak)?;
+        }
+        fs::rename(&self.path, &to)?;
+        Ok(())
+    }
+}
+
+impl Write for RotatingFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        if self.inner.is_none() {
+            self.open_file().map_err(std::io::Error::other)?;
+        }
+
+        if self.current_size != 0 && self.current_size + (self.buffer.len() as u64) > self.max_size
+        {
+            self.rotate().map_err(std::io::Error::other)?;
+        }
+
+        if let Some(file) = self.inner.as_mut() {
+            file.write_all(&self.buffer)?;
+            self.current_size += self.buffer.len() as u64;
+            file.flush()?;
+        }
+        self.buffer.clear();
+        Ok(())
     }
 }
 
@@ -159,22 +337,30 @@ pub enum TargetKind {
     ///
     /// ### Platform-specific
     ///
-    /// |Platform | Value                                                                                     | Example                                                     |
-    /// | ------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-    /// | Linux   | `$XDG_DATA_HOME/{bundleIdentifier}/logs` or `$HOME/.local/share/{bundleIdentifier}/logs`  | `/home/alice/.local/share/com.tauri.dev/logs`               |
-    /// | macOS   | `{homeDir}/Library/Logs/{bundleIdentifier}`                                               | `/Users/Alice/Library/Logs/com.tauri.dev`                   |
-    /// | Windows | `{FOLDERID_LocalAppData}/{bundleIdentifier}/logs`                                         | `C:\Users\Alice\AppData\Local\com.tauri.dev\logs`           |
+    /// |Platform   | Value                                                                                     | Example                                                     |
+    /// | --------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+    /// | Linux     | `$XDG_DATA_HOME/{bundleIdentifier}/logs` or `$HOME/.local/share/{bundleIdentifier}/logs`  | `/home/alice/.local/share/com.tauri.dev/logs`               |
+    /// | macOS/iOS | `{homeDir}/Library/Logs/{bundleIdentifier}`                                               | `/Users/Alice/Library/Logs/com.tauri.dev`                   |
+    /// | Windows   | `{FOLDERID_LocalAppData}/{bundleIdentifier}/logs`                                         | `C:\Users\Alice\AppData\Local\com.tauri.dev\logs`           |
+    /// | Android   | `{ConfigDir}/logs`                                                                        | `/data/data/com.tauri.dev/files/logs`                       |
     LogDir { file_name: Option<String> },
     /// Forward logs to the webview (via the `log://log` event).
     ///
     /// This requires the webview to subscribe to log events, via this plugins `attachConsole` function.
     Webview,
+    /// Send logs to a [`fern::Dispatch`]
+    ///
+    /// You can use this to construct arbitrary log targets.
+    Dispatch(fern::Dispatch),
 }
+
+type Formatter = dyn Fn(FormatCallback, &Arguments, &Record) + Send + Sync + 'static;
 
 /// A log target.
 pub struct Target {
     kind: TargetKind,
     filters: Vec<Box<Filter>>,
+    formatter: Option<Box<Formatter>>,
 }
 
 impl Target {
@@ -183,6 +369,7 @@ impl Target {
         Self {
             kind,
             filters: Vec::new(),
+            formatter: None,
         }
     }
 
@@ -194,36 +381,15 @@ impl Target {
         self.filters.push(Box::new(filter));
         self
     }
-}
 
-#[tauri::command]
-fn log(
-    level: LogLevel,
-    message: String,
-    location: Option<&str>,
-    file: Option<&str>,
-    line: Option<u32>,
-    key_values: Option<HashMap<String, String>>,
-) {
-    let level = log::Level::from(level);
-
-    let target = if let Some(location) = location {
-        format!("{WEBVIEW_TARGET}:{location}")
-    } else {
-        WEBVIEW_TARGET.to_string()
-    };
-
-    let mut builder = RecordBuilder::new();
-    builder.level(level).target(&target).file(file).line(line);
-
-    let key_values = key_values.unwrap_or_default();
-    let mut kv = HashMap::new();
-    for (k, v) in key_values.iter() {
-        kv.insert(k.as_str(), v.as_str());
+    #[inline]
+    pub fn format<F>(mut self, formatter: F) -> Self
+    where
+        F: Fn(FormatCallback, &Arguments, &Record) + Send + Sync + 'static,
+    {
+        self.formatter.replace(Box::new(formatter));
+        self
     }
-    builder.key_values(&kv);
-
-    logger().log(&builder.args(format_args!("{message}")).build());
 }
 
 pub struct Builder {
@@ -238,9 +404,7 @@ pub struct Builder {
 impl Default for Builder {
     fn default() -> Self {
         #[cfg(desktop)]
-        let format =
-            time::format_description::parse("[[[year]-[month]-[day]][[[hour]:[minute]:[second]]")
-                .unwrap();
+        let format = format_description!("[[[year]-[month]-[day]][[[hour]:[minute]:[second]]");
         let dispatch = fern::Dispatch::new().format(move |out, message, record| {
             out.finish(
                 #[cfg(mobile)]
@@ -259,7 +423,7 @@ impl Default for Builder {
             dispatch,
             rotation_strategy: DEFAULT_ROTATION_STRATEGY,
             timezone_strategy: DEFAULT_TIMEZONE_STRATEGY,
-            max_file_size: DEFAULT_MAX_FILE_SIZE,
+            max_file_size: DEFAULT_MAX_FILE_SIZE as u128,
             targets: DEFAULT_LOG_TARGETS.into(),
             is_skip_logger: false,
         }
@@ -279,9 +443,7 @@ impl Builder {
     pub fn timezone_strategy(mut self, timezone_strategy: TimezoneStrategy) -> Self {
         self.timezone_strategy = timezone_strategy.clone();
 
-        let format =
-            time::format_description::parse("[[[year]-[month]-[day]][[[hour]:[minute]:[second]]")
-                .unwrap();
+        let format = format_description!("[[[year]-[month]-[day]][[[hour]:[minute]:[second]]");
         self.dispatch = self.dispatch.format(move |out, message, record| {
             out.finish(format_args!(
                 "{}[{}][{}] {}",
@@ -294,8 +456,19 @@ impl Builder {
         self
     }
 
+    /// Sets the maximum file size for log rotation.
+    ///
+    /// Values larger than `u64::MAX` will be clamped to `u64::MAX`.
+    /// In v3, this parameter will be changed to `u64`.
     pub fn max_file_size(mut self, max_file_size: u128) -> Self {
-        self.max_file_size = max_file_size;
+        self.max_file_size = max_file_size.min(u64::MAX as u128);
+        self
+    }
+
+    pub fn clear_format(mut self) -> Self {
+        self.dispatch = self.dispatch.format(|out, message, _record| {
+            out.finish(format_args!("{message}"));
+        });
         self
     }
 
@@ -345,7 +518,7 @@ impl Builder {
 
     /// Skip the creation and global registration of a logger
     ///
-    /// If you wish to use your own global logger, you must call `skip_logger` so that the plugin does not attempt to set a second global logger. In this configuration, no logger will be created and the plugin's `log` command will rely on the result of `log::logger()`. You will be responsible for configuring the logger yourself and any included targets will be ignored. This can also be used with `tracing-log` or if running tests in parallel that require the plugin to be registered.
+    /// If you wish to use your own global logger, you must call `skip_logger` so that the plugin does not attempt to set a second global logger. In this configuration, no logger will be created and the plugin's `log` command will rely on the result of `log::logger()`. You will be responsible for configuring the logger yourself and any included targets will be ignored. If ever initializing the plugin multiple times, such as if registering the plugin while testing, call this method to avoid panicking when registering multiple loggers. For interacting with `tracing`, you can leverage the `tracing-log` logger to forward logs to `tracing` or enable the `tracing` feature for this plugin to emit events directly to the tracing system. Both scenarios require calling this method.
     /// ```rust
     /// static LOGGER: SimpleLogger = SimpleLogger;
     ///
@@ -359,12 +532,11 @@ impl Builder {
         self
     }
 
-    /// Adds a collection of targets to the logger.
+    /// Replaces the targets of the logger.
     ///
     /// ```rust
     /// use tauri_plugin_log::{Target, TargetKind, WEBVIEW_TARGET};
     /// tauri_plugin_log::Builder::new()
-    ///     .clear_targets()
     ///     .targets([
     ///         Target::new(TargetKind::Webview),
     ///         Target::new(TargetKind::LogDir { file_name: Some("webview".into()) }).filter(|metadata| metadata.target().starts_with(WEBVIEW_TARGET)),
@@ -378,9 +550,7 @@ impl Builder {
 
     #[cfg(feature = "colored")]
     pub fn with_colors(self, colors: fern::colors::ColoredLevelConfig) -> Self {
-        let format =
-            time::format_description::parse("[[[year]-[month]-[day]][[[hour]:[minute]:[second]]")
-                .unwrap();
+        let format = format_description!("[[[year]-[month]-[day]][[[hour]:[minute]:[second]]");
 
         let timezone_strategy = self.timezone_strategy.clone();
         self.format(move |out, message, record| {
@@ -399,7 +569,7 @@ impl Builder {
         mut dispatch: fern::Dispatch,
         rotation_strategy: RotationStrategy,
         timezone_strategy: TimezoneStrategy,
-        max_file_size: u128,
+        max_file_size: u64,
         targets: Vec<Target>,
     ) -> Result<(log::LevelFilter, Box<dyn log::Log>), Error> {
         let app_name = &app_handle.package_info().name;
@@ -409,6 +579,9 @@ impl Builder {
             let mut target_dispatch = fern::Dispatch::new();
             for filter in target.filters {
                 target_dispatch = target_dispatch.filter(filter);
+            }
+            if let Some(formatter) = target.formatter {
+                target_dispatch = target_dispatch.format(formatter);
             }
 
             let logger = match target.kind {
@@ -442,32 +615,29 @@ impl Builder {
                         fs::create_dir_all(&path)?;
                     }
 
-                    fern::log_file(get_log_file_path(
+                    let rotator = RotatingFile::new(
                         &path,
-                        file_name.as_deref().unwrap_or(app_name),
-                        &rotation_strategy,
-                        &timezone_strategy,
+                        file_name.unwrap_or(app_name.clone()),
                         max_file_size,
-                    )?)?
-                    .into()
+                        rotation_strategy.clone(),
+                        timezone_strategy.clone(),
+                    )?;
+                    fern::Output::writer(Box::new(rotator), "\n")
                 }
-                #[cfg(mobile)]
-                TargetKind::LogDir { .. } => continue,
-                #[cfg(desktop)]
                 TargetKind::LogDir { file_name } => {
                     let path = app_handle.path().app_log_dir()?;
                     if !path.exists() {
                         fs::create_dir_all(&path)?;
                     }
 
-                    fern::log_file(get_log_file_path(
+                    let rotator = RotatingFile::new(
                         &path,
-                        file_name.as_deref().unwrap_or(app_name),
-                        &rotation_strategy,
-                        &timezone_strategy,
+                        file_name.unwrap_or(app_name.clone()),
                         max_file_size,
-                    )?)?
-                    .into()
+                        rotation_strategy.clone(),
+                        timezone_strategy.clone(),
+                    )?;
+                    fern::Output::writer(Box::new(rotator), "\n")
                 }
                 TargetKind::Webview => {
                     let app_handle = app_handle.clone();
@@ -483,6 +653,7 @@ impl Builder {
                         });
                     })
                 }
+                TargetKind::Dispatch(dispatch) => dispatch.into(),
             };
             target_dispatch = target_dispatch.chain(logger);
 
@@ -493,7 +664,7 @@ impl Builder {
     }
 
     fn plugin_builder<R: Runtime>() -> plugin::Builder<R> {
-        plugin::Builder::new("log").invoke_handler(tauri::generate_handler![log])
+        plugin::Builder::new("log").invoke_handler(tauri::generate_handler![commands::log])
     }
 
     #[allow(clippy::type_complexity)]
@@ -510,7 +681,7 @@ impl Builder {
             self.dispatch,
             self.rotation_strategy,
             self.timezone_strategy,
-            self.max_file_size,
+            self.max_file_size as u64,
             self.targets,
         )?;
 
@@ -526,7 +697,7 @@ impl Builder {
                         self.dispatch,
                         self.rotation_strategy,
                         self.timezone_strategy,
-                        self.max_file_size,
+                        self.max_file_size as u64,
                         self.targets,
                     )?;
                     attach_logger(max_level, log)?;
@@ -545,52 +716,4 @@ pub fn attach_logger(
     log::set_boxed_logger(log)?;
     log::set_max_level(max_level);
     Ok(())
-}
-
-fn get_log_file_path(
-    dir: &impl AsRef<Path>,
-    file_name: &str,
-    rotation_strategy: &RotationStrategy,
-    timezone_strategy: &TimezoneStrategy,
-    max_file_size: u128,
-) -> Result<PathBuf, Error> {
-    let path = dir.as_ref().join(format!("{file_name}.log"));
-
-    if path.exists() {
-        let log_size = File::open(&path)?.metadata()?.len() as u128;
-        if log_size > max_file_size {
-            match rotation_strategy {
-                RotationStrategy::KeepAll => {
-                    let to = dir.as_ref().join(format!(
-                        "{}_{}.log",
-                        file_name,
-                        timezone_strategy
-                            .get_now()
-                            .format(&time::format_description::parse(
-                                "[year]-[month]-[day]_[hour]-[minute]-[second]"
-                            )?)?,
-                    ));
-                    if to.is_file() {
-                        // designated rotated log file name already exists
-                        // highly unlikely but defensively handle anyway by adding .bak to filename
-                        let mut to_bak = to.clone();
-                        to_bak.set_file_name(format!(
-                            "{}.bak",
-                            to_bak
-                                .file_name()
-                                .map(|f| f.to_string_lossy())
-                                .unwrap_or_default()
-                        ));
-                        fs::rename(&to, to_bak)?;
-                    }
-                    fs::rename(&path, to)?;
-                }
-                RotationStrategy::KeepOne => {
-                    fs::remove_file(&path)?;
-                }
-            }
-        }
-    }
-
-    Ok(path)
 }

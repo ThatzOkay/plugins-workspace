@@ -8,6 +8,7 @@
   let filter = null;
   let multiple = false;
   let directory = false;
+  let pickerMode = "";
 
   function arrayBufferToBase64(buffer, callback) {
     var blob = new Blob([buffer], {
@@ -44,6 +45,13 @@
     await message("Tauri is awesome!");
   }
 
+  async function msgCustom(result) {
+    const buttons = { yes: "awesome", no: "amazing", cancel: "stunning" };
+    await message(`Tauri is: `, { buttons })
+      .then((res) => onMessage(`Tauri is ${res}`))
+      .catch(onMessage);
+  }
+
   function openDialog() {
     open({
       title: "My wonderful open dialog",
@@ -58,6 +66,7 @@
         : [],
       multiple,
       directory,
+      pickerMode: pickerMode === "" ? undefined : pickerMode,
     })
       .then(function (res) {
         if (Array.isArray(res)) {
@@ -87,7 +96,7 @@
                 onMessage(res);
               }
             })
-            .catch(onMessage(res));
+            .catch(onMessage);
         }
       })
       .catch(onMessage);
@@ -105,7 +114,7 @@
             },
           ]
         : [],
-    })
+      })
       .then(onMessage)
       .catch(onMessage);
   }
@@ -135,13 +144,28 @@
   <input type="checkbox" id="dialog-directory" bind:checked={directory} />
   <label for="dialog-directory">Directory</label>
 </div>
+<div>
+  <label for="dialog-picker-mode">Picker Mode:</label>
+  <select id="dialog-picker-mode" bind:value={pickerMode}>
+    <option value="">None</option>
+    <option value="media">Media</option>
+    <option value="image">Image</option>
+    <option value="video">Video</option>
+    <option value="document">Document</option>
+  </select>
+</div>
 <br />
-<button class="btn" id="open-dialog" on:click={openDialog}>Open dialog</button>
-<button class="btn" id="save-dialog" on:click={saveDialog}
-  >Open save dialog</button
->
-<button class="btn" id="prompt-dialog" on:click={prompt}>Prompt</button>
-<button class="btn" id="custom-prompt-dialog" on:click={promptCustom}
-  >Prompt (custom)</button
->
-<button class="btn" id="message-dialog" on:click={msg}>Message</button>
+
+<div class="flex flex-wrap flex-col md:flex-row gap-2 children:flex-shrink-0">
+  <button class="btn" id="open-dialog" on:click={openDialog}>Open dialog</button>
+  <button class="btn" id="save-dialog" on:click={saveDialog}
+    >Open save dialog</button
+  >
+  <button class="btn" id="prompt-dialog" on:click={prompt}>Prompt</button>
+  <button class="btn" id="custom-prompt-dialog" on:click={promptCustom}
+    >Prompt (custom)</button
+  >
+  <button class="btn" id="message-dialog" on:click={msg}>Message</button>
+  <button class="btn" id="message-dialog" on:click={msgCustom}>Message (custom)</button>
+
+</div>
